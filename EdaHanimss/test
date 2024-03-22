@@ -1,0 +1,190 @@
+Why my code is not working
+
+consumers.py
+
+
+```
+from channels.generic.websocket import AsyncWebsocketConsumer
+import asyncio
+import json
+from game.pong import PingPong
+
+class GameConsumer(AsyncWebsocketConsumer):
+	game_instances = {}
+
+	async def connect(self):
+		self.room_name = self.scope['url_route']['kwargs']['room_name']
+		self.room_group_name = f"game_{self.room_name}"
+		await self.channel_layer.group_add(
+			self.room_group_name,
+			self.channel_name
+		)
+		await self.accept()
+		self.pong = self.create_game_instance()
+		asyncio.ensure_future(self.game_loop())
+
+	async def disconnect(self, close_code):
+		await self.channel_layer.group_discard(
+			self.room_group_name,
+			self.channel_name
+		)
+
+	async def countdown(self):
+		for i in range(5, 0, -1):
+			await self.channel_layer_group_send('countdown', str(i))
+			await asyncio.sleep(1)
+
+	async def game_loop(self):
+		connected_players = len(self.channel_layer.groups.get(self.room_group_name, set()))
+		if connected_players < 2:
+			await self.channel_layer_group_send('waiting_for_players')
+		else:
+			await self.countdown()
+			await self.channel_layer_group_send('game_status','game_started')
+			while connected_players == 2:
+				#print("test")
+				await self.get_game_state()  # Change to call get_game_state method
+				if self.pong.game_over:
+					await self.channel_layer_group_send('game_status', 'game_over')
+				await asyncio.sleep(0.05)
+
+	async def receive(self, text_data):
+		data = json.loads(text_data)
+		message = data.get('message')
+		if message:
+			if message['action'] == 'START':
+				self.pong.start_with_initial_values(message)  # Fix method name to match
+			elif message['direction']:
+				self.pong.update_paddle_position(message)
+
+	def create_game_instance(self):
+		if self.room_name not in self.game_instances:
+			self.game_instances[self.room_name] = PingPong()
+		return self.game_instances[self.room_name]
+
+	async def game_message(self, event):
+		message = event['message']
+		await self.send(text_data=json.dumps(message))
+
+	async def channel_layer_group_send(self, state, message=None):
+		await self.channel_layer.group_send(
+			self.room_group_name,
+			{
+				'type': 'game_message',
+				'game_state': state,
+				'message': message
+			}
+		)
+
+	async def get_game_state(self):
+		await self.pong.get_game_state(self.channel_layer_group_send)  # Pass channel layer send method
+
+```
+
+pong.py
+
+
+```
+import json
+
+class Ball:
+	VEL = 5
+	COLOR = (255, 255, 255)
+
+	def __init__(self, x, y, radius):
+		self.x = self.original_x = x
+		self.y = self.original_y = y
+		self.radius = radius
+		self.x_vel = self.VEL
+		self.y_vel = 0
+		self.winner = -1
+
+	def move(self):
+		self.x += self.x_vel
+		self.y += self.y_vel
+
+	def reset(self, direction):
+		self.x = self.original_x
+		self.y = self.original_y
+		self.VEL = 5
+		if direction == "left":
+			self.x_vel = self.VEL
+			self.y_vel = 0
+		elif direction == "right":
+			self.x_vel = -self.VEL
+			self.y_vel = 0
+		elif direction == "up":
+			self.x_vel = 0
+			self.y_vel = self.VEL
+		elif direction == "down":
+			self.x_vel = 0
+			self.y_vel = -self.VEL
+
+class Player:
+	def __init__(self, x, y, width, height, color):
+		self.x = x
+		self.y = y
+		self.width = width
+		self.height = height
+		self.color = color
+		self.rect = (x,y,width,height)
+		self.vel = 3
+		self.score = 0
+
+	def move(self, posY):
+		if posY == -1:
+			self.y -= self.vel
+		if posY == 1:
+			self.y += self.vel
+		self.update()
+
+	def update(self):
+		self.rect = (self.x, self.y, self.width, self.height)
+
+class PingPong:
+	def __init__(self):
+		self.paddle_r = Player(10, 200, 20, 100, (255, 255, 255))  # Example paddle initialization
+		self.paddle_l = Player(670, 200, 20, 100, (255, 255, 255))  # Example paddle initialization
+		self.ball = Ball(350, 250, 7)  # Example ball initialization
+		self.game_over = False
+
+	async def get_game_state(self, send_function):
+		self.ball.move()
+		# Handle collision logic
+		self.handle_collision()
+		# Update score and ball position
+		self.update_score()
+
+		game_state = {
+			'type': 'update',
+			'ball_x': self.ball.x,
+			'ball_y': self.ball.y,
+			'paddle_l': self.paddle_l.y,
+			'paddle_r': self.paddle_r.y,
+			'left_score': self.paddle_l.score,
+			'right_score': self.paddle_r.score,
+		}
+		if self.paddle_l.score != 5 and self.paddle_r.score != 5:
+			self.game_over = True
+		await send_function('game_status', json.dumps(game_state))
+
+	def handle_collision(self):
+		if self.ball.x - self.ball.radius < self.paddle_l.x + self.paddle_l.width and \
+				self.paddle_l.y < self.ball.y < self.paddle_l.y + self.paddle_l.height:
+			self.ball.x_vel = abs(self.ball.x_vel)  # Change ball's x velocity direction
+		elif self.ball.x + self.ball.radius > self.paddle_r.x and \
+				self.paddle_r.y < self.ball.y < self.paddle_r.y + self.paddle_r.height:
+			self.ball.x_vel = -abs(self.ball.x_vel)  # Change ball's x velocity direction
+
+		if self.ball.y - self.ball.radius <= 0 or self.ball.y + self.ball.radius >= 500:
+			self.ball.y_vel *= -1  # Reverse ball's y velocity if it hits top or bottom walls
+
+	def update_score(self):
+		if self.ball.x - self.ball.radius <= 0:
+			self.paddle_r.score += 1  # Increment right paddle's score if the ball goes beyond left wall
+			self.ball.reset("right")
+		elif self.ball.x + self.ball.radius >= 700:
+			self.paddle_l.score += 1  # Increment left paddle's score if the ball goes beyond right wall
+			self.ball.reset("left")
+
+```
